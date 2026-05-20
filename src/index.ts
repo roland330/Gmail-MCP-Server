@@ -444,10 +444,58 @@ async function main() {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
 
+        // Resolve a raw Gmail message id to its real RFC 822 Message-ID +
+        // References chain headers. Returns null on failure so callers
+        // can degrade gracefully (will still work for non-reply drafts).
+        //
+        // Roland 2026-05-20: required for reply-in-thread drafts with
+        // attachments. Without this, nodemailer wraps the raw Gmail id
+        // (e.g. '19e4410c0d200a90') into '<19e4410c0d200a90>' which Gmail
+        // can't match to any real Message-ID in the thread, breaking the
+        // draft's link to the original message — UI shows only a 1KB
+        // blocked.gif placeholder instead of the real attached files.
+        async function resolveReplyHeaders(
+            gmailMessageId: string,
+        ): Promise<{ messageId: string | null; references: string | null }> {
+            try {
+                const response = await gmail.users.messages.get({
+                    userId: 'me',
+                    id: gmailMessageId,
+                    format: 'metadata',
+                    metadataHeaders: ['Message-ID', 'Message-Id', 'References'],
+                });
+                const headers = response.data.payload?.headers || [];
+                const findHeader = (name: string) =>
+                    headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || null;
+                const msgId = findHeader('message-id');
+                const existingRefs = findHeader('references');
+                // References chain: existing references + the message we're replying to
+                const refs = existingRefs && msgId
+                    ? `${existingRefs} ${msgId}`
+                    : (msgId || existingRefs);
+                return { messageId: msgId, references: refs };
+            } catch (e) {
+                console.error(`Failed to resolve reply headers for ${gmailMessageId}:`, e);
+                return { messageId: null, references: null };
+            }
+        }
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
             let message: string;
-            
+
             try {
+                // For replies, if inReplyTo looks like a raw Gmail id (16 hex
+                // chars), resolve it to the real RFC 822 Message-ID + build
+                // the proper References chain. Skip if caller already passed
+                // a proper '<msg-id@domain>' formatted value.
+                if (validatedArgs.inReplyTo && /^[a-f0-9]{16,}$/i.test(String(validatedArgs.inReplyTo))) {
+                    const resolved = await resolveReplyHeaders(validatedArgs.inReplyTo);
+                    if (resolved.messageId) {
+                        validatedArgs.inReplyToHeader = resolved.messageId;
+                        validatedArgs.referencesHeader = resolved.references || resolved.messageId;
+                    }
+                }
+
                 // Check if we have attachments
                 if (validatedArgs.attachments && validatedArgs.attachments.length > 0) {
                     // Use Nodemailer to create properly formatted RFC822 message

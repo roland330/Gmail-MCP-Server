@@ -65,6 +65,12 @@ export function createEmailMessage(validatedArgs: any): string {
         }
     });
 
+    // Build In-Reply-To + References from caller-provided RFC 822 Message-ID
+    // (or fall back to raw inReplyTo; see createEmailWithNodemailer for full
+    // explanation of why the resolved Message-ID is required for reply drafts).
+    const inReplyToHeader = validatedArgs.inReplyToHeader || validatedArgs.inReplyTo;
+    const referencesHeader = validatedArgs.referencesHeader || validatedArgs.inReplyToHeader || validatedArgs.inReplyTo;
+
     // Common email headers
     const emailParts = [
         `From: ${getFromHeader()}`,
@@ -73,8 +79,8 @@ export function createEmailMessage(validatedArgs: any): string {
         validatedArgs.bcc ? `Bcc: ${validatedArgs.bcc.join(', ')}` : '',
         `Subject: ${encodedSubject}`,
         // Add thread-related headers if specified
-        validatedArgs.inReplyTo ? `In-Reply-To: ${validatedArgs.inReplyTo}` : '',
-        validatedArgs.inReplyTo ? `References: ${validatedArgs.inReplyTo}` : '',
+        inReplyToHeader ? `In-Reply-To: ${inReplyToHeader}` : '',
+        referencesHeader ? `References: ${referencesHeader}` : '',
         'MIME-Version: 1.0',
     ].filter(Boolean);
 
@@ -150,6 +156,27 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
         });
     }
 
+    // Build proper In-Reply-To + References headers.
+    //
+    // Roland 2026-05-20: caller may pass either:
+    //   (a) a raw Gmail message id (e.g. '19e4410c0d200a90') — Gmail's
+    //       internal short id used by the REST API, OR
+    //   (b) a real RFC 822 Message-ID (e.g. '<CABx...@mail.gmail.com>')
+    //       extracted from the original email's headers via
+    //       gmail.users.messages.get(format='metadata').
+    //
+    // For draft-in-thread + attachments to render correctly in Gmail UI,
+    // the In-Reply-To/References headers MUST be the RFC 822 Message-ID;
+    // otherwise Gmail can't link the draft to the original message and the
+    // compose pane silently breaks the attachments (shows only a 1KB
+    // blocked.gif placeholder instead of the real files).
+    //
+    // The caller (index.ts) is expected to resolve raw Gmail ids → real
+    // Message-IDs before invoking this helper. As a safety net we also
+    // accept a separate `inReplyToHeader` field that takes precedence.
+    const inReplyToHeader = validatedArgs.inReplyToHeader || validatedArgs.inReplyTo;
+    const referencesHeader = validatedArgs.referencesHeader || validatedArgs.inReplyToHeader || validatedArgs.inReplyTo;
+
     const mailOptions = {
         // Explicit From with RFC 2047 encoding for non-ASCII display names
         // (nodemailer auto-encodes). Avoids 'me' substitution mojibake
@@ -162,14 +189,24 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
         text: validatedArgs.body,
         html: validatedArgs.htmlBody,
         attachments: attachments,
-        inReplyTo: validatedArgs.inReplyTo,
-        references: validatedArgs.inReplyTo
+        inReplyTo: inReplyToHeader,
+        references: referencesHeader
     };
 
     // Generate the raw message
     const info = await transporter.sendMail(mailOptions);
-    const rawMessage = info.message.toString();
-    
+    let rawMessage = info.message.toString();
+
+    // Fix CTE: Nodemailer may generate 'Content-Transfer-Encoding: 7bit'
+    // for ASCII text parts, but Gmail draft renderer chokes on 7bit with
+    // UTF-8 charset declaration → draft appears blank in compose UI.
+    // Same root cause as the createEmailMessage() fix (commit 173c39f).
+    // Post-process to 8bit which is RFC-valid for UTF-8 content.
+    rawMessage = rawMessage.replace(
+        /Content-Transfer-Encoding: 7bit/g,
+        'Content-Transfer-Encoding: 8bit'
+    );
+
     return rawMessage;
 }
 
