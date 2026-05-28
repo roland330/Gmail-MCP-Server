@@ -207,6 +207,25 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
         'Content-Transfer-Encoding: 8bit'
     );
 
+    // Unfold RFC 5322 folded headers (Gmail attachment-chip rendering bug workaround).
+    // Roland 2026-05-28 marker.sk incident: nodemailer folded
+    //   Content-Type: application/pdf; name="LongFilename-Komplexny-...pdf"
+    // onto a 2nd line (CRLF+TAB continuation) when the line exceeded ~78 chars.
+    // Gmail's attachment-chip / quote rendering doesn't follow the continuation,
+    // so it saw `application/pdf;` without `name=` → fell back to the previous
+    // attachment's filename in its cache → both attachments displayed with the
+    // SAME filename in the recipient's Gmail UI (even though the underlying PDF
+    // bytes were correctly different — verified via gmail.users.messages.get).
+    //
+    // Krčmárik (marker.sk) saw "2× Linkbuilding-ponuka-Marker-2026.pdf" instead
+    // of "Komplexny... + Linkbuilding..." and replied that one attachment was
+    // missing. Real cause was display-layer dedup, not delivery failure.
+    //
+    // This unfolds all folded header continuations into single lines. Body
+    // content (base64 / quoted-printable) never has leading whitespace on a
+    // line, so we don't accidentally munge body data.
+    rawMessage = rawMessage.replace(/\r?\n[\t ]+/g, ' ');
+
     return rawMessage;
 }
 
