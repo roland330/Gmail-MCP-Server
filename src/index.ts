@@ -225,6 +225,10 @@ const DeleteEmailSchema = z.object({
     messageId: z.string().describe("ID of the email message to delete"),
 });
 
+const DeleteDraftSchema = z.object({
+    draftId: z.string().describe("ID of the draft to delete (the ID returned by draft_email). Only deletes drafts — cannot touch sent/received mail."),
+});
+
 // New schema for listing email labels
 const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
 
@@ -372,6 +376,11 @@ async function main() {
                 name: "delete_email",
                 description: "Permanently deletes an email",
                 inputSchema: zodToJsonSchema(DeleteEmailSchema),
+            },
+            {
+                name: "delete_draft",
+                description: "Deletes a draft by its draft ID (from draft_email). Safe: uses the Gmail drafts API, so it only ever removes drafts and cannot delete sent/received emails. Works with gmail.modify scope (no full-mail-delete permission needed).",
+                inputSchema: zodToJsonSchema(DeleteDraftSchema),
             },
             {
                 name: "list_email_labels",
@@ -804,6 +813,23 @@ async function main() {
                             {
                                 type: "text",
                                 text: `Email ${validatedArgs.messageId} deleted successfully`,
+                            },
+                        ],
+                    };
+                }
+
+                case "delete_draft": {
+                    const validatedArgs = DeleteDraftSchema.parse(args);
+                    await gmail.users.drafts.delete({
+                        userId: 'me',
+                        id: validatedArgs.draftId,
+                    });
+
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Draft ${validatedArgs.draftId} deleted successfully`,
                             },
                         ],
                     };
