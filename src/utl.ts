@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { lookup as mimeLookup } from 'mime-types';
 import nodemailer from 'nodemailer';
+import crypto from 'crypto';
 
 /**
  * Helper function to encode email headers containing non-ASCII characters
@@ -126,6 +127,51 @@ export function createEmailMessage(validatedArgs: any): string {
 }
 
 
+/**
+ * Inject a UNIQUE Content-ID header into every attachment MIME part that
+ * doesn't already have one.
+ *
+ * Roland 2026-07-01 (inceram incident, recurring): the MCP creates a DRAFT
+ * with raw-inserted (base64) attachments and Roland then clicks Send in the
+ * Gmail WEB compose UI. On that send path — and only that path (not the API
+ * messages.send / drafts.send) — Gmail re-serialises the message and stamps
+ * EVERY attachment part with an identical EMPTY `Content-ID: <>`. Strict
+ * recipient mail clients key their attachment list on Content-ID (RFC 2392
+ * requires it to be globally unique); two parts sharing the same empty key get
+ * deduped, so the recipient sees only the first attachment (the objednávka)
+ * and not the second (the zálohová faktúra). Roland's own Gmail is tolerant
+ * and renders both, which is why only recipients complain. Precedents:
+ * RFC 2392, Roundcube #7214, Swiftmailer #1173. Same failure CLASS as the
+ * marker.sk 2026-05-28 folded-filename dedup (unfold patch b1e366a) but a
+ * different collision key, which is why it recurs even with short filenames.
+ *
+ * Gmail empirically PRESERVES pre-existing unique Content-IDs through send, so
+ * pre-seeding a distinct Content-ID per attachment pre-empts the empty-`<>`
+ * collision. MUST run AFTER the header-unfold below so every part header is a
+ * single line (safe anchoring). Idempotent (skips parts that already carry a
+ * Content-ID); boundary-scoped to the outer multipart; attachment-only; never
+ * forces multipart/related (keeps Content-Disposition: attachment untouched).
+ */
+function injectUniqueContentIds(rawMessage: string, fromHeader: string): string {
+    const outer = rawMessage.match(/Content-Type:\s*multipart\/[^\r\n]*boundary="?([^";\r\n]+)"?/i);
+    if (!outer) return rawMessage; // no multipart container → no attachments to fix
+    const nl = rawMessage.includes('\r\n') ? '\r\n' : '\n';
+    const sep = nl + nl;
+    const domMatch = fromHeader.match(/@([A-Za-z0-9.\-]+)/);
+    const domain = domMatch ? domMatch[1] : 'increaseo.sk';
+    const delim = '--' + outer[1];
+    return rawMessage.split(delim).map(seg => {
+        const idx = seg.indexOf(sep);
+        if (idx < 0) return seg;                                              // preamble/epilogue, no header block
+        const headers = seg.slice(0, idx);
+        if (!/Content-Disposition:\s*attachment/i.test(headers)) return seg;  // not an attachment part
+        if (/(^|\r?\n)Content-ID:/i.test(headers)) return seg;                // idempotent: already has one
+        const cid = `<att-${crypto.randomUUID()}@${domain}>`;
+        return headers + nl + 'Content-ID: ' + cid + seg.slice(idx);
+    }).join(delim);
+}
+
+
 export async function createEmailWithNodemailer(validatedArgs: any): Promise<string> {
     // Validate email addresses
     (validatedArgs.to as string[]).forEach(email => {
@@ -225,6 +271,12 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
     // content (base64 / quoted-printable) never has leading whitespace on a
     // line, so we don't accidentally munge body data.
     rawMessage = rawMessage.replace(/\r?\n[\t ]+/g, ' ');
+
+    // Pre-seed a unique Content-ID per attachment so Gmail's web-compose Send
+    // can't collapse them under an identical empty `Content-ID: <>` (see
+    // injectUniqueContentIds — Roland 2026-07-01 inceram incident). Runs last,
+    // after the unfold, so attachment part headers are already single-line.
+    rawMessage = injectUniqueContentIds(rawMessage, getFromHeader());
 
     return rawMessage;
 }
