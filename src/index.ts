@@ -489,6 +489,33 @@ async function main() {
             }
         }
 
+        // ---- Poistky po incidente 2026-07-08 (gabriel.sk LB report doručený klientke 3×) ----
+        // Odoslaná správa sa NIKDY nemaže: messages.delete NIE JE unsend — príjemca už
+        // doručenú kópiu má a zmazaním zmizne jediná lokálna stopa o odoslaní (Sent,
+        // in:anywhere aj bežné vyhľadávanie; ostane len history.list messagesDeleted).
+        // Každý send/draft/delete sa navyše appenduje do ~/.gmail-mcp/tool-audit.jsonl —
+        // nezávislý per-Mac dôkaz o tom, čo cez tento server reálne odišlo/zmizlo.
+        const AUDIT_LOG_PATH = path.join(CONFIG_DIR, 'tool-audit.jsonl');
+        function auditLog(entry: Record<string, unknown>) {
+            try {
+                fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+            } catch (e: any) {
+                console.error('tool-audit append failed:', e?.message || e);
+            }
+        }
+        async function assertDeletableNotSent(messageId: string, tool: string) {
+            const meta = await gmail.users.messages.get({ userId: 'me', id: messageId, format: 'minimal' });
+            const labels = meta.data.labelIds || [];
+            if (labels.includes('SENT')) {
+                auditLog({ tool, messageId, blocked: 'SENT-delete refused' });
+                throw new Error(
+                    `ODMIETNUTÉ: správa ${messageId} má label SENT (odoslaná kópia). Zmazanie odoslanej správy ` +
+                    `NIE JE unsend — príjemca ju má doručenú a zmizol by jediný dôkaz o odoslaní (incident 2026-07-08 ` +
+                    `gabriel.sk). Ak ju naozaj treba upratať, presuň ju cez modify_email do TRASH a povedz Rolandovi.`
+                );
+            }
+        }
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
             let message: string;
 
@@ -523,7 +550,9 @@ async function main() {
                                 ...(validatedArgs.threadId && { threadId: validatedArgs.threadId })
                             }
                         });
-                        
+                        auditLog({ tool: 'send_email', to: validatedArgs.to, cc: validatedArgs.cc, subject: validatedArgs.subject,
+                                   attachments: validatedArgs.attachments?.length || 0, threadId: validatedArgs.threadId, resultId: result.data.id });
+
                         return {
                             content: [
                                 {
@@ -550,6 +579,8 @@ async function main() {
                                 message: messageRequest,
                             },
                         });
+                        auditLog({ tool: 'draft_email', to: validatedArgs.to, subject: validatedArgs.subject,
+                                   attachments: validatedArgs.attachments?.length || 0, threadId: validatedArgs.threadId, draftId: response.data.id });
                         return {
                             content: [
                                 {
@@ -588,6 +619,8 @@ async function main() {
                             userId: 'me',
                             requestBody: messageRequest,
                         });
+                        auditLog({ tool: 'send_email', to: validatedArgs.to, cc: validatedArgs.cc, subject: validatedArgs.subject,
+                                   attachments: 0, threadId: validatedArgs.threadId, resultId: response.data.id });
                         return {
                             content: [
                                 {
@@ -603,6 +636,8 @@ async function main() {
                                 message: messageRequest,
                         },
                         });
+                        auditLog({ tool: 'draft_email', to: validatedArgs.to, subject: validatedArgs.subject,
+                                   attachments: 0, threadId: validatedArgs.threadId, draftId: response.data.id });
                         return {
                             content: [
                                 {
@@ -803,10 +838,12 @@ async function main() {
 
                 case "delete_email": {
                     const validatedArgs = DeleteEmailSchema.parse(args);
+                    await assertDeletableNotSent(validatedArgs.messageId, 'delete_email');
                     await gmail.users.messages.delete({
                         userId: 'me',
                         id: validatedArgs.messageId,
                     });
+                    auditLog({ tool: 'delete_email', messageId: validatedArgs.messageId });
 
                     return {
                         content: [
@@ -824,6 +861,7 @@ async function main() {
                         userId: 'me',
                         id: validatedArgs.draftId,
                     });
+                    auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId });
 
                     return {
                         content: [
@@ -924,6 +962,7 @@ async function main() {
                         async (batch) => {
                             const results = await Promise.all(
                                 batch.map(async (messageId) => {
+                                    await assertDeletableNotSent(messageId, 'batch_delete_emails');
                                     await gmail.users.messages.delete({
                                         userId: 'me',
                                         id: messageId,
@@ -938,7 +977,8 @@ async function main() {
                     // Generate summary of the operation
                     const successCount = successes.length;
                     const failureCount = failures.length;
-                    
+                    auditLog({ tool: 'batch_delete_emails', requested: messageIds.length, deleted: successCount, refusedOrFailed: failureCount });
+
                     let resultText = `Batch delete operation complete.\n`;
                     resultText += `Successfully deleted: ${successCount} messages\n`;
                     
