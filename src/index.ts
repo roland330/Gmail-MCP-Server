@@ -516,7 +516,43 @@ async function main() {
             }
         }
 
+        // Debounce proti duplicitnému odoslaniu cez tento server (incident gabriel.sk
+        // 2026-07-08: klient dostal identický report viackrát). Ak rovnaká množina
+        // príjemcov + rovnaký subject odišla cez send_email za posledných 10 min,
+        // ďalší send ODMIETNI. Číta per-Mac tool-audit.jsonl. Legitímny resend po
+        // 10 min prejde. Pozn.: chráni len cestu cez tento MCP server; tichý send z
+        // raw skriptu / externého klienta chytá mailbox-level watchdog (sent_delete_watch.py).
+        function recentDuplicateSend(toArr: any, subject: any): boolean {
+            try {
+                if (!fs.existsSync(AUDIT_LOG_PATH)) return false;
+                const norm = (t: any) => (Array.isArray(t) ? t : [t]).map(x => String(x).toLowerCase().trim()).sort().join(',');
+                const key = norm(toArr) + '|' + String(subject || '').trim();
+                const lines = fs.readFileSync(AUDIT_LOG_PATH, 'utf8').trim().split('\n').slice(-80);
+                const now = Date.now();
+                for (const ln of lines) {
+                    let e: any;
+                    try { e = JSON.parse(ln); } catch { continue; }
+                    if (e.tool !== 'send_email' || !e.ts) continue;
+                    const ek = norm(e.to) + '|' + String(e.subject || '').trim();
+                    if (ek !== key) continue;
+                    const age = now - Date.parse(e.ts);
+                    if (age >= 0 && age < 10 * 60 * 1000) return true;
+                }
+            } catch (e: any) {
+                console.error('recentDuplicateSend check failed:', e?.message || e);
+            }
+            return false;
+        }
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
+            if (action === "send" && recentDuplicateSend(validatedArgs.to, validatedArgs.subject)) {
+                auditLog({ tool: 'send_email', to: validatedArgs.to, subject: validatedArgs.subject, blocked: 'duplicate-send within 10min' });
+                throw new Error(
+                    `ODMIETNUTÉ: identický email (rovnakí príjemcovia + subject) už odišiel cez tento server za ` +
+                    `posledných 10 minút — poistka proti duplicitnému odoslaniu (incident gabriel.sk 2026-07-08, ` +
+                    `klient dostal report 3×). Ak je opakované odoslanie naozaj zámerné, počkaj 10 minút alebo to over s Rolandom.`
+                );
+            }
             let message: string;
 
             try {
