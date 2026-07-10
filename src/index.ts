@@ -225,6 +225,10 @@ const DeleteEmailSchema = z.object({
     messageId: z.string().describe("ID of the email message to delete"),
 });
 
+const DeleteDraftSchema = z.object({
+    draftId: z.string().describe("ID of the draft to delete (the ID returned by draft_email). Only deletes drafts — cannot touch sent/received mail."),
+});
+
 // New schema for listing email labels
 const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
 
@@ -374,6 +378,11 @@ async function main() {
                 inputSchema: zodToJsonSchema(DeleteEmailSchema),
             },
             {
+                name: "delete_draft",
+                description: "Deletes a draft by its draft ID (from draft_email). Safe: uses the Gmail drafts API, so it only ever removes drafts and cannot delete sent/received emails. Works with gmail.modify scope (no full-mail-delete permission needed).",
+                inputSchema: zodToJsonSchema(DeleteDraftSchema),
+            },
+            {
                 name: "list_email_labels",
                 description: "Retrieves all available Gmail labels",
                 inputSchema: zodToJsonSchema(ListEmailLabelsSchema),
@@ -480,7 +489,70 @@ async function main() {
             }
         }
 
+        // ---- Poistky po incidente 2026-07-08 (gabriel.sk LB report doručený klientke 3×) ----
+        // Odoslaná správa sa NIKDY nemaže: messages.delete NIE JE unsend — príjemca už
+        // doručenú kópiu má a zmazaním zmizne jediná lokálna stopa o odoslaní (Sent,
+        // in:anywhere aj bežné vyhľadávanie; ostane len history.list messagesDeleted).
+        // Každý send/draft/delete sa navyše appenduje do ~/.gmail-mcp/tool-audit.jsonl —
+        // nezávislý per-Mac dôkaz o tom, čo cez tento server reálne odišlo/zmizlo.
+        const AUDIT_LOG_PATH = path.join(CONFIG_DIR, 'tool-audit.jsonl');
+        function auditLog(entry: Record<string, unknown>) {
+            try {
+                fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+            } catch (e: any) {
+                console.error('tool-audit append failed:', e?.message || e);
+            }
+        }
+        async function assertDeletableNotSent(messageId: string, tool: string) {
+            const meta = await gmail.users.messages.get({ userId: 'me', id: messageId, format: 'minimal' });
+            const labels = meta.data.labelIds || [];
+            if (labels.includes('SENT')) {
+                auditLog({ tool, messageId, blocked: 'SENT-delete refused' });
+                throw new Error(
+                    `ODMIETNUTÉ: správa ${messageId} má label SENT (odoslaná kópia). Zmazanie odoslanej správy ` +
+                    `NIE JE unsend — príjemca ju má doručenú a zmizol by jediný dôkaz o odoslaní (incident 2026-07-08 ` +
+                    `gabriel.sk). Ak ju naozaj treba upratať, presuň ju cez modify_email do TRASH a povedz Rolandovi.`
+                );
+            }
+        }
+
+        // Debounce proti duplicitnému odoslaniu cez tento server (incident gabriel.sk
+        // 2026-07-08: klient dostal identický report viackrát). Ak rovnaká množina
+        // príjemcov + rovnaký subject odišla cez send_email za posledných 10 min,
+        // ďalší send ODMIETNI. Číta per-Mac tool-audit.jsonl. Legitímny resend po
+        // 10 min prejde. Pozn.: chráni len cestu cez tento MCP server; tichý send z
+        // raw skriptu / externého klienta chytá mailbox-level watchdog (sent_delete_watch.py).
+        function recentDuplicateSend(toArr: any, subject: any): boolean {
+            try {
+                if (!fs.existsSync(AUDIT_LOG_PATH)) return false;
+                const norm = (t: any) => (Array.isArray(t) ? t : [t]).map(x => String(x).toLowerCase().trim()).sort().join(',');
+                const key = norm(toArr) + '|' + String(subject || '').trim();
+                const lines = fs.readFileSync(AUDIT_LOG_PATH, 'utf8').trim().split('\n').slice(-80);
+                const now = Date.now();
+                for (const ln of lines) {
+                    let e: any;
+                    try { e = JSON.parse(ln); } catch { continue; }
+                    if (e.tool !== 'send_email' || !e.ts) continue;
+                    const ek = norm(e.to) + '|' + String(e.subject || '').trim();
+                    if (ek !== key) continue;
+                    const age = now - Date.parse(e.ts);
+                    if (age >= 0 && age < 10 * 60 * 1000) return true;
+                }
+            } catch (e: any) {
+                console.error('recentDuplicateSend check failed:', e?.message || e);
+            }
+            return false;
+        }
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
+            if (action === "send" && recentDuplicateSend(validatedArgs.to, validatedArgs.subject)) {
+                auditLog({ tool: 'send_email', to: validatedArgs.to, subject: validatedArgs.subject, blocked: 'duplicate-send within 10min' });
+                throw new Error(
+                    `ODMIETNUTÉ: identický email (rovnakí príjemcovia + subject) už odišiel cez tento server za ` +
+                    `posledných 10 minút — poistka proti duplicitnému odoslaniu (incident gabriel.sk 2026-07-08, ` +
+                    `klient dostal report 3×). Ak je opakované odoslanie naozaj zámerné, počkaj 10 minút alebo to over s Rolandom.`
+                );
+            }
             let message: string;
 
             try {
@@ -514,7 +586,9 @@ async function main() {
                                 ...(validatedArgs.threadId && { threadId: validatedArgs.threadId })
                             }
                         });
-                        
+                        auditLog({ tool: 'send_email', to: validatedArgs.to, cc: validatedArgs.cc, subject: validatedArgs.subject,
+                                   attachments: validatedArgs.attachments?.length || 0, threadId: validatedArgs.threadId, resultId: result.data.id });
+
                         return {
                             content: [
                                 {
@@ -541,6 +615,8 @@ async function main() {
                                 message: messageRequest,
                             },
                         });
+                        auditLog({ tool: 'draft_email', to: validatedArgs.to, subject: validatedArgs.subject,
+                                   attachments: validatedArgs.attachments?.length || 0, threadId: validatedArgs.threadId, draftId: response.data.id });
                         return {
                             content: [
                                 {
@@ -579,6 +655,8 @@ async function main() {
                             userId: 'me',
                             requestBody: messageRequest,
                         });
+                        auditLog({ tool: 'send_email', to: validatedArgs.to, cc: validatedArgs.cc, subject: validatedArgs.subject,
+                                   attachments: 0, threadId: validatedArgs.threadId, resultId: response.data.id });
                         return {
                             content: [
                                 {
@@ -594,6 +672,8 @@ async function main() {
                                 message: messageRequest,
                         },
                         });
+                        auditLog({ tool: 'draft_email', to: validatedArgs.to, subject: validatedArgs.subject,
+                                   attachments: 0, threadId: validatedArgs.threadId, draftId: response.data.id });
                         return {
                             content: [
                                 {
@@ -794,16 +874,79 @@ async function main() {
 
                 case "delete_email": {
                     const validatedArgs = DeleteEmailSchema.parse(args);
+                    await assertDeletableNotSent(validatedArgs.messageId, 'delete_email');
                     await gmail.users.messages.delete({
                         userId: 'me',
                         id: validatedArgs.messageId,
                     });
+                    auditLog({ tool: 'delete_email', messageId: validatedArgs.messageId });
 
                     return {
                         content: [
                             {
                                 type: "text",
                                 text: `Email ${validatedArgs.messageId} deleted successfully`,
+                            },
+                        ],
+                    };
+                }
+
+                case "delete_draft": {
+                    const validatedArgs = DeleteDraftSchema.parse(args);
+
+                    // ---- Guard po incidente 2026-07-10 (perfetto wheat-harvest) ----
+                    // Ak Roland draft medzičasom ODOSLAL v Gmail UI, drafts.delete na
+                    // pôvodné draftId Gmail zresolvuje na FINÁLNU (odoslanú) správu
+                    // a hard-deletne ju zo Sent (empiricky overené: send 9:51, náš
+                    // drafts.delete 9:52:36 → history messagesDeleted SENT správy).
+                    // Rovnaká trieda ako assertDeletableNotSent pri delete_email.
+                    // Preto pred delete over, na akú správu draft REÁLNE ukazuje:
+                    //  - drafts.get 404  → draft už neexistuje (typicky odoslaný)
+                    //                      → NIČ nemazať, benígny výsledok.
+                    //  - bound message má label SENT → ODMIETNUŤ (mazali by sme
+                    //                      odoslanú správu).
+                    let boundMsgId: string | null = null;
+                    try {
+                        const dr = await gmail.users.drafts.get({
+                            userId: 'me',
+                            id: validatedArgs.draftId,
+                            format: 'minimal',
+                        });
+                        boundMsgId = dr.data.message?.id || null;
+                    } catch (e: any) {
+                        auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId, skipped: 'drafts.get failed (draft gone — likely already sent or deleted)' });
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Draft ${validatedArgs.draftId} už neexistuje (pravdepodobne bol medzičasom odoslaný alebo zmazaný). NIČ som nemazal — ak bol odoslaný, správa v Sent ostáva nedotknutá.`,
+                                },
+                            ],
+                        };
+                    }
+                    if (boundMsgId) {
+                        const meta = await gmail.users.messages.get({ userId: 'me', id: boundMsgId, format: 'minimal' });
+                        const labels = meta.data.labelIds || [];
+                        if (labels.includes('SENT')) {
+                            auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId, boundMsgId, blocked: 'draft resolves to SENT message' });
+                            throw new Error(
+                                `ODMIETNUTÉ: draft ${validatedArgs.draftId} sa medzičasom ODOSLAL (jeho správa ${boundMsgId} má label SENT). ` +
+                                `drafts.delete by zmazal ODOSLANÚ správu zo Sent (incident 2026-07-10 perfetto). Nemažem — odoslaná správa ostáva.`
+                            );
+                        }
+                    }
+
+                    await gmail.users.drafts.delete({
+                        userId: 'me',
+                        id: validatedArgs.draftId,
+                    });
+                    auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId, boundMsgId });
+
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Draft ${validatedArgs.draftId} deleted successfully`,
                             },
                         ],
                     };
@@ -898,6 +1041,7 @@ async function main() {
                         async (batch) => {
                             const results = await Promise.all(
                                 batch.map(async (messageId) => {
+                                    await assertDeletableNotSent(messageId, 'batch_delete_emails');
                                     await gmail.users.messages.delete({
                                         userId: 'me',
                                         id: messageId,
@@ -912,7 +1056,8 @@ async function main() {
                     // Generate summary of the operation
                     const successCount = successes.length;
                     const failureCount = failures.length;
-                    
+                    auditLog({ tool: 'batch_delete_emails', requested: messageIds.length, deleted: successCount, refusedOrFailed: failureCount });
+
                     let resultText = `Batch delete operation complete.\n`;
                     resultText += `Successfully deleted: ${successCount} messages\n`;
                     
