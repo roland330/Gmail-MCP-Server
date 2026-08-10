@@ -893,11 +893,54 @@ async function main() {
 
                 case "delete_draft": {
                     const validatedArgs = DeleteDraftSchema.parse(args);
+
+                    // ---- Guard po incidente 2026-07-10 (perfetto wheat-harvest) ----
+                    // Ak Roland draft medzičasom ODOSLAL v Gmail UI, drafts.delete na
+                    // pôvodné draftId Gmail zresolvuje na FINÁLNU (odoslanú) správu
+                    // a hard-deletne ju zo Sent (empiricky overené: send 9:51, náš
+                    // drafts.delete 9:52:36 → history messagesDeleted SENT správy).
+                    // Rovnaká trieda ako assertDeletableNotSent pri delete_email.
+                    // Preto pred delete over, na akú správu draft REÁLNE ukazuje:
+                    //  - drafts.get 404  → draft už neexistuje (typicky odoslaný)
+                    //                      → NIČ nemazať, benígny výsledok.
+                    //  - bound message má label SENT → ODMIETNUŤ (mazali by sme
+                    //                      odoslanú správu).
+                    let boundMsgId: string | null = null;
+                    try {
+                        const dr = await gmail.users.drafts.get({
+                            userId: 'me',
+                            id: validatedArgs.draftId,
+                            format: 'minimal',
+                        });
+                        boundMsgId = dr.data.message?.id || null;
+                    } catch (e: any) {
+                        auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId, skipped: 'drafts.get failed (draft gone — likely already sent or deleted)' });
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Draft ${validatedArgs.draftId} už neexistuje (pravdepodobne bol medzičasom odoslaný alebo zmazaný). NIČ som nemazal — ak bol odoslaný, správa v Sent ostáva nedotknutá.`,
+                                },
+                            ],
+                        };
+                    }
+                    if (boundMsgId) {
+                        const meta = await gmail.users.messages.get({ userId: 'me', id: boundMsgId, format: 'minimal' });
+                        const labels = meta.data.labelIds || [];
+                        if (labels.includes('SENT')) {
+                            auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId, boundMsgId, blocked: 'draft resolves to SENT message' });
+                            throw new Error(
+                                `ODMIETNUTÉ: draft ${validatedArgs.draftId} sa medzičasom ODOSLAL (jeho správa ${boundMsgId} má label SENT). ` +
+                                `drafts.delete by zmazal ODOSLANÚ správu zo Sent (incident 2026-07-10 perfetto). Nemažem — odoslaná správa ostáva.`
+                            );
+                        }
+                    }
+
                     await gmail.users.drafts.delete({
                         userId: 'me',
                         id: validatedArgs.draftId,
                     });
-                    auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId });
+                    auditLog({ tool: 'delete_draft', draftId: validatedArgs.draftId, boundMsgId });
 
                     return {
                         content: [
