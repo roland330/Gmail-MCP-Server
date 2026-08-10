@@ -18,6 +18,61 @@ function encodeEmailHeader(text: string): string {
 }
 
 /**
+ * RFC 2047 encode a *display name* into one or more encoded-words.
+ *
+ * Unlike encodeEmailHeader() this splits the UTF-8 byte stream into chunks of
+ * max 45 bytes, so no single encoded-word exceeds the RFC 2047 limit of 75
+ * chars ('=?UTF-8?B?' + 60 base64 chars + '?=' = 72). Chunk boundaries respect
+ * multi-byte code points. Adjacent encoded-words separated by a single space
+ * are concatenated by the reader without that space (RFC 2047 §6.2).
+ * Pure-ASCII input is returned untouched.
+ */
+function encodeDisplayName(name: string): string {
+    if (!/[^\x00-\x7F]/.test(name)) return name;
+    const MAX_BYTES = 45;
+    const words: string[] = [];
+    let chunk = '';
+    for (const ch of name) {                       // iterates by code point
+        const chBytes = Buffer.byteLength(ch, 'utf8');
+        if (Buffer.byteLength(chunk, 'utf8') + chBytes > MAX_BYTES) {
+            words.push('=?UTF-8?B?' + Buffer.from(chunk, 'utf8').toString('base64') + '?=');
+            chunk = '';
+        }
+        chunk += ch;
+    }
+    if (chunk) words.push('=?UTF-8?B?' + Buffer.from(chunk, 'utf8').toString('base64') + '?=');
+    return words.join(' ');
+}
+
+/**
+ * RFC 2047 encode the display name inside an address header value.
+ *
+ * Roland 2026-08-10: createEmailMessage() interpolated getFromHeader() raw into
+ * the `From:` line, so the header carried raw 8-bit UTF-8 bytes ("Vojkovský").
+ * RFC 5322 headers are 7-bit only; Gmail falls back to latin-1 for such bytes,
+ * which is what the recipient saw as "Roland VojkovskÃ½" (classic UTF-8 read as
+ * latin-1 mojibake). The attachment path was unaffected because nodemailer
+ * encodes the display name itself — hence only the no-attachment drafts broke.
+ *
+ * Accepts: '"Display Name" <addr>', 'Display Name <addr>', 'addr', 'me'.
+ * ASCII display names (and bare addresses / 'me') are returned unchanged.
+ * The encoded-word is emitted WITHOUT surrounding quotes — an encoded-word is
+ * not recognised inside a quoted-string (RFC 2047 §5).
+ */
+export function encodeAddressHeader(value: string): string {
+    const m = value.match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+    if (!m) return value;                       // bare address or 'me' — nothing to encode
+    const addr = m[2].trim();
+    let name = m[1].trim();
+    if (!name) return `<${addr}>`;
+    if (name.length >= 2 && name.startsWith('"') && name.endsWith('"')) {
+        name = name.slice(1, -1).replace(/\\(["\\])/g, '$1');
+    }
+    if (!/[^\x00-\x7F]/.test(name)) return value;   // pure ASCII → keep original formatting
+    return `${encodeDisplayName(name)} <${addr}>`;
+}
+
+/**
  * Build a proper From header value with RFC 2047 encoding for non-ASCII
  * display names. Reads GMAIL_FROM env var (format: '"Display Name" <email>'
  * or 'email'). Falls back to GMAIL_FROM_NAME + GMAIL_FROM_ADDRESS combo.
@@ -74,7 +129,10 @@ export function createEmailMessage(validatedArgs: any): string {
 
     // Common email headers
     const emailParts = [
-        `From: ${getFromHeader()}`,
+        // RFC 2047: display name must be encoded — raw UTF-8 bytes in a header
+        // render as mojibake ("Roland VojkovskÃ½"). Nodemailer path does this
+        // on its own, this manual-MIME path did not (Roland 2026-08-10).
+        `From: ${encodeAddressHeader(getFromHeader())}`,
         `To: ${validatedArgs.to.join(', ')}`,
         validatedArgs.cc ? `Cc: ${validatedArgs.cc.join(', ')}` : '',
         validatedArgs.bcc ? `Bcc: ${validatedArgs.bcc.join(', ')}` : '',
