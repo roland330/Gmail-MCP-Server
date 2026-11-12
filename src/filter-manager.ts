@@ -67,8 +67,21 @@ export async function listFilters(gmail: any) {
             userId: 'me',
         });
 
-        const filters = response.data.filters || [];
-        
+        // Gmail API ListFiltersResponse names the array `filter` (singular), not `filters`.
+        // Reading `filters` returned [] for every account (incident ylux.sk 2026-11-12:
+        // roland@ has 62 filters, tool said "No filters found"). `filters` kept as fallback.
+        // An account with zero filters returns `{}`; any other unknown shape fails loud
+        // instead of silently reporting "no filters" to a security check.
+        const data = response.data || {};
+        const raw = data.filter ?? data.filters;
+        if (raw !== undefined && !Array.isArray(raw)) {
+            throw new Error(`Unexpected filters.list response: filter is ${typeof raw}`);
+        }
+        if (raw === undefined && Object.keys(data).length > 0) {
+            throw new Error(`Unexpected filters.list response keys: ${Object.keys(data).join(', ')}`);
+        }
+        const filters = raw || [];
+
         return {
             filters,
             count: filters.length
