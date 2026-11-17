@@ -745,8 +745,16 @@ async function main() {
                     const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
                     const from = headers.find(h => h.name?.toLowerCase() === 'from')?.value || '';
                     const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || '';
+                    // Cc vypisujeme VŽDY (aj prázdne): bez riadku Cc sa z výstupu dalo usúdiť, že
+                    // správa išla len adresátom v To (incident Collabim/Savira 17. 11. 2026 – Pulkit mal
+                    // info@collabim.com aj podpora@collabim.cz v kópii, read_email ich neukázal).
+                    const cc = headers.find(h => h.name?.toLowerCase() === 'cc')?.value || '';
+                    const bcc = headers.find(h => h.name?.toLowerCase() === 'bcc')?.value || '';
+                    const replyTo = headers.find(h => h.name?.toLowerCase() === 'reply-to')?.value || '';
                     const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
                     const threadId = response.data.threadId || '';
+                    const recipientLines = `To: ${to}\nCc: ${cc || '(none)'}\n` +
+                        (bcc ? `Bcc: ${bcc}\n` : '') + (replyTo ? `Reply-To: ${replyTo}\n` : '');
 
                     // Extract email content using the recursive function
                     const { text, html } = extractEmailContent(response.data.payload as GmailMessagePart || {});
@@ -792,7 +800,7 @@ async function main() {
                         content: [
                             {
                                 type: "text",
-                                text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
+                                text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\n${recipientLines}Date: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
                             },
                         ],
                     };
